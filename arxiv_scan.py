@@ -211,14 +211,32 @@ def main():
     args = ap.parse_args()
 
     now = dt.datetime.now(dt.timezone.utc)
-    seen, entries = set(), []
+    seen, entries, errors = set(), [], []
     for cat in CATEGORIES:
-        feed = fetch_recent(cat, MAX_RESULTS_PER_CAT)
-        for e in parse_feed(feed):
-            if e["id"] not in seen and within_days(e["published"], args.days, now):
-                seen.add(e["id"])
-                entries.append(e)
+        try:
+            feed = fetch_recent(cat, MAX_RESULTS_PER_CAT)
+            for e in parse_feed(feed):
+                if e["id"] not in seen and within_days(e["published"], args.days, now):
+                    seen.add(e["id"])
+                    entries.append(e)
+        except Exception as ex:                       # network/parse failure
+            errors.append(f"{cat}: {type(ex).__name__}: {ex}")
         time.sleep(REQUEST_PAUSE_S)
+
+    if errors and not entries:
+        # Total failure: still write a digest so latest.md exists and is honest.
+        day = now.date().isoformat()
+        os.makedirs(args.outdir, exist_ok=True)
+        msg = (f"# arXiv digest -- {day}\n\n"
+               f"**Scan error -- no papers retrieved.** The arXiv API could not be "
+               f"reached or returned nothing on this run.\n\n"
+               + "\n".join(f"- {e}" for e in errors)
+               + "\n\nThis is NOT a 'no hits' result; the window was not scanned.\n")
+        for name in (f"{day}.md", "latest.md"):
+            with open(os.path.join(args.outdir, name), "w") as f:
+                f.write(msg)
+        print("Scan error; wrote error digest.\n" + "\n".join(errors))
+        sys.exit(1)
 
     hits = {"CRITICAL": [], "RELEVANT": [], "FYI": []}
     for e in entries:
@@ -233,16 +251,18 @@ def main():
 
     if args.stdout:
         print(digest)
-    else:
-        os.makedirs(args.outdir, exist_ok=True)
-        path = os.path.join(args.outdir, f"{day}.md")
-        with open(path, "w") as f:
-            f.write(digest)
-        print(f"Wrote {path}  ({len(hits['CRITICAL'])} critical, "
-              f"{len(hits['RELEVANT'])} relevant, {len(hits['FYI'])} fyi)")
-        # Nonzero exit if CRITICAL, so CI can notify loudly if desired.
-        if hits["CRITICAL"]:
-            sys.exit(0)  # change to sys.exit(2) to make CI mark the run
+        return
+    os.makedirs(args.outdir, exist_ok=True)
+    path = os.path.join(args.outdir, f"{day}.md")
+    with open(path, "w") as f:
+        f.write(digest)
+    # Always refresh the stable pointer here in Python, so the workflow
+    # never depends on a separate cp step or on a dated filename matching.
+    with open(os.path.join(args.outdir, "latest.md"), "w") as f:
+        f.write(digest)
+    print(f"Wrote {path} and latest.md  ({len(hits['CRITICAL'])} critical, "
+          f"{len(hits['RELEVANT'])} relevant, {len(hits['FYI'])} fyi; "
+          f"{len(entries)} papers scanned)")
 
 
 if __name__ == "__main__":
