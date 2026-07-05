@@ -1,5 +1,3 @@
-.github/workflows/arxiv-digest.yml
-
 name: arXiv daily digest
 
 on:
