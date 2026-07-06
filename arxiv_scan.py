@@ -128,17 +128,26 @@ def parse_feed(xml_bytes: bytes) -> list:
             "abstract": re.sub(r"\s+", " ", text("summary")),
             "authors": authors,
             "published": text("published"),   # ISO 8601
+            "updated": text("updated"),       # ISO 8601 (may differ)
             "link": f"https://arxiv.org/abs/{arxiv_id}",
         })
     return entries
 
 
-def within_days(published_iso: str, days: int, now: dt.datetime) -> bool:
+def _parse_iso(s: str):
     try:
-        pub = dt.datetime.fromisoformat(published_iso.replace("Z", "+00:00"))
-    except ValueError:
-        return False
-    return (now - pub) <= dt.timedelta(days=days)
+        return dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return None
+
+def within_days(entry, days: int, now: dt.datetime) -> bool:
+    # Accept if published OR updated falls within the window. Robust to the
+    # arXiv submittedDate-sort quirks around weekends / UTC boundaries.
+    for key in ("published", "updated"):
+        t = _parse_iso(entry.get(key, "")) if isinstance(entry, dict) else None
+        if t is not None and dt.timedelta(0) <= (now - t) <= dt.timedelta(days=days):
+            return True
+    return False
 
 
 def author_hit(entry: dict):
@@ -220,7 +229,7 @@ def format_digest(hits: dict, day: str, days: int, n_scanned: int) -> str:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--days", type=int, default=2)
+    ap.add_argument("--days", type=int, default=4)
     ap.add_argument("--outdir", default="digests")
     ap.add_argument("--stdout", action="store_true")
     args = ap.parse_args()
@@ -233,7 +242,7 @@ def main():
             parsed = parse_feed(feed)
             kept = 0
             for e in parsed:
-                if e["id"] not in seen and within_days(e["published"], args.days, now):
+                if e["id"] not in seen and within_days(e, args.days, now):
                     seen.add(e["id"])
                     entries.append(e)
                     kept += 1
@@ -245,6 +254,29 @@ def main():
             errors.append(f"{cat}: {type(ex).__name__}: {ex}")
             print(f"  [error] {cat}: {type(ex).__name__}: {ex}")
         time.sleep(REQUEST_PAUSE_S)
+
+    # Holiday safety net: if the window caught nothing but we DID retrieve a
+    # feed, report the most recent announcement batch instead of an empty
+    # digest, so the scan is never silently vacuous after a long weekend.
+    if not entries and not errors:
+        pool = []
+        for cat in CATEGORIES:
+            try:
+                pool.extend(parse_feed(fetch_recent(cat, MAX_RESULTS_PER_CAT)))
+                time.sleep(REQUEST_PAUSE_S)
+            except Exception:
+                pass
+        # newest published date present in the pool
+        dated = [(_parse_iso(e.get("published","")), e) for e in pool]
+        dated = [(t, e) for (t, e) in dated if t is not None]
+        if dated:
+            newest = max(t for t, _ in dated).date()
+            seen2 = set()
+            for t, e in dated:
+                if t.date() == newest and e["id"] not in seen2:
+                    seen2.add(e["id"]); entries.append(e)
+            print(f"  [fallback] window empty; reporting newest batch "
+                  f"{newest} ({len(entries)} papers)")
 
     if errors and not entries:
         # Total failure: still write a digest so latest.md exists and is honest.
